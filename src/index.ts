@@ -60,7 +60,7 @@ export type { WebSocketManagerConfig, WebSocketManagerEvents } from './clients/w
 export { RealtimeService } from './services/realtime-service.js';
 export type { Subscription, MarketSubscriptionHandlers } from './services/realtime-service.js';
 
-// ArbitrageService (Real-time arbitrage detection and execution)
+// ArbitrageService (Real-time arbitrage detection, execution, rebalancing, and settlement)
 export { ArbitrageService } from './services/arbitrage-service.js';
 export type {
   ArbitrageMarketConfig,
@@ -70,6 +70,11 @@ export type {
   ArbitrageServiceEvents,
   OrderbookState,
   BalanceState,
+  // Rebalancer types
+  RebalanceAction,
+  RebalanceResult,
+  // Settle types
+  SettleResult,
 } from './services/arbitrage-service.js';
 
 // Trading

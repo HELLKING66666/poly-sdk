@@ -61,6 +61,48 @@ export interface ArbitrageServiceConfig {
   enableLogging?: boolean;
   /** Cooldown between executions in ms (default: 5000) */
   executionCooldown?: number;
+
+  // ===== Rebalancer Config =====
+  /** Enable auto-rebalancing (default: false) */
+  enableRebalancer?: boolean;
+  /** Minimum USDC ratio 0-1 (default: 0.2 = 20%) - Split if below */
+  minUsdcRatio?: number;
+  /** Maximum USDC ratio 0-1 (default: 0.8 = 80%) - Merge if above */
+  maxUsdcRatio?: number;
+  /** Target USDC ratio when rebalancing (default: 0.5 = 50%) */
+  targetUsdcRatio?: number;
+  /** Max YES/NO imbalance before auto-fix (default: 5 tokens) */
+  imbalanceThreshold?: number;
+  /** Rebalance check interval in ms (default: 10000) */
+  rebalanceInterval?: number;
+}
+
+export interface RebalanceAction {
+  type: 'split' | 'merge' | 'sell_yes' | 'sell_no' | 'none';
+  amount: number;
+  reason: string;
+  priority: number;
+}
+
+export interface RebalanceResult {
+  success: boolean;
+  action: RebalanceAction;
+  txHash?: string;
+  error?: string;
+}
+
+export interface SettleResult {
+  market: ArbitrageMarketConfig;
+  yesBalance: number;
+  noBalance: number;
+  pairedTokens: number;
+  unpairedYes: number;
+  unpairedNo: number;
+  merged: boolean;
+  mergeAmount?: number;
+  mergeTxHash?: string;
+  usdcRecovered?: number;
+  error?: string;
 }
 
 export interface OrderbookState {
@@ -120,6 +162,8 @@ export interface ArbitrageServiceEvents {
   execution: (result: ArbitrageExecutionResult) => void;
   balanceUpdate: (balance: BalanceState) => void;
   orderbookUpdate: (orderbook: OrderbookState) => void;
+  rebalance: (result: RebalanceResult) => void;
+  settle: (result: SettleResult) => void;
   error: (error: Error) => void;
   started: (market: ArbitrageMarketConfig) => void;
   stopped: () => void;
@@ -134,9 +178,10 @@ export class ArbitrageService extends EventEmitter {
   private rateLimiter: RateLimiter;
 
   private market: ArbitrageMarketConfig | null = null;
-  private config: Required<Omit<ArbitrageServiceConfig, 'privateKey' | 'rpcUrl'>> & {
+  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval'> & {
     privateKey?: string;
     rpcUrl?: string;
+    rebalanceIntervalMs: number;
   };
 
   private orderbook: OrderbookState = {
@@ -157,7 +202,9 @@ export class ArbitrageService extends EventEmitter {
   private isExecuting = false;
   private lastExecutionTime = 0;
   private balanceUpdateInterval: ReturnType<typeof setInterval> | null = null;
+  private rebalanceInterval: ReturnType<typeof setInterval> | null = null;
   private isRunning = false;
+  private totalCapital = 0;
 
   // Statistics
   private stats = {
@@ -181,6 +228,13 @@ export class ArbitrageService extends EventEmitter {
       autoExecute: config.autoExecute ?? false,
       enableLogging: config.enableLogging ?? true,
       executionCooldown: config.executionCooldown ?? 5000,
+      // Rebalancer config
+      enableRebalancer: config.enableRebalancer ?? false,
+      minUsdcRatio: config.minUsdcRatio ?? 0.2,
+      maxUsdcRatio: config.maxUsdcRatio ?? 0.8,
+      targetUsdcRatio: config.targetUsdcRatio ?? 0.5,
+      imbalanceThreshold: config.imbalanceThreshold ?? 5,
+      rebalanceIntervalMs: config.rebalanceInterval ?? 10000,
     };
 
     this.rateLimiter = new RateLimiter();
@@ -232,8 +286,22 @@ export class ArbitrageService extends EventEmitter {
       this.log(`YES Tokens: ${this.balance.yesTokens.toFixed(2)}`);
       this.log(`NO Tokens: ${this.balance.noTokens.toFixed(2)}`);
 
+      // Calculate total capital (USDC + paired tokens)
+      const pairedTokens = Math.min(this.balance.yesTokens, this.balance.noTokens);
+      this.totalCapital = this.balance.usdc + pairedTokens;
+      this.log(`Total Capital: ${this.totalCapital.toFixed(2)}`);
+
       // Start balance update interval
       this.balanceUpdateInterval = setInterval(() => this.updateBalance(), 30000);
+
+      // Start rebalancer if enabled
+      if (this.config.enableRebalancer) {
+        this.log(`Rebalancer: ENABLED (USDC range: ${(this.config.minUsdcRatio * 100).toFixed(0)}%-${(this.config.maxUsdcRatio * 100).toFixed(0)}%, target: ${(this.config.targetUsdcRatio * 100).toFixed(0)}%)`);
+        this.rebalanceInterval = setInterval(
+          () => this.checkAndRebalance(),
+          this.config.rebalanceIntervalMs
+        );
+      }
     } else {
       this.log('No wallet configured - monitoring only');
     }
@@ -256,6 +324,11 @@ export class ArbitrageService extends EventEmitter {
     if (this.balanceUpdateInterval) {
       clearInterval(this.balanceUpdateInterval);
       this.balanceUpdateInterval = null;
+    }
+
+    if (this.rebalanceInterval) {
+      clearInterval(this.rebalanceInterval);
+      this.rebalanceInterval = null;
     }
 
     await this.wsManager.unsubscribeAll();
@@ -426,6 +499,289 @@ export class ArbitrageService extends EventEmitter {
     }
   }
 
+  // ===== Rebalancer Methods =====
+
+  /**
+   * Calculate recommended rebalance action based on current state
+   */
+  calculateRebalanceAction(): RebalanceAction {
+    if (!this.market || this.totalCapital === 0) {
+      return { type: 'none', amount: 0, reason: 'No market or capital', priority: 0 };
+    }
+
+    const { usdc, yesTokens, noTokens } = this.balance;
+    const pairedTokens = Math.min(yesTokens, noTokens);
+    const currentTotal = usdc + pairedTokens;
+    const usdcRatio = usdc / currentTotal;
+    const tokenImbalance = yesTokens - noTokens;
+
+    // Priority 1: Fix YES/NO imbalance (highest priority - risk control)
+    if (Math.abs(tokenImbalance) > this.config.imbalanceThreshold) {
+      if (tokenImbalance > 0) {
+        const sellAmount = Math.min(tokenImbalance, yesTokens * 0.5);
+        if (sellAmount >= this.config.minTradeSize) {
+          return {
+            type: 'sell_yes',
+            amount: Math.floor(sellAmount * 1e6) / 1e6,
+            reason: `Risk: YES > NO by ${tokenImbalance.toFixed(2)}`,
+            priority: 100,
+          };
+        }
+      } else {
+        const sellAmount = Math.min(-tokenImbalance, noTokens * 0.5);
+        if (sellAmount >= this.config.minTradeSize) {
+          return {
+            type: 'sell_no',
+            amount: Math.floor(sellAmount * 1e6) / 1e6,
+            reason: `Risk: NO > YES by ${(-tokenImbalance).toFixed(2)}`,
+            priority: 100,
+          };
+        }
+      }
+    }
+
+    // Priority 2: USDC ratio too high (> maxUsdcRatio) → Split to create tokens
+    if (usdcRatio > this.config.maxUsdcRatio) {
+      const targetUsdc = this.totalCapital * this.config.targetUsdcRatio;
+      const excessUsdc = usdc - targetUsdc;
+      const splitAmount = Math.min(excessUsdc * 0.5, usdc * 0.3);
+      if (splitAmount >= this.config.minTradeSize) {
+        return {
+          type: 'split',
+          amount: Math.floor(splitAmount * 100) / 100,
+          reason: `USDC ${(usdcRatio * 100).toFixed(0)}% > ${(this.config.maxUsdcRatio * 100).toFixed(0)}% max`,
+          priority: 50,
+        };
+      }
+    }
+
+    // Priority 3: USDC ratio too low (< minUsdcRatio) → Merge tokens to recover USDC
+    if (usdcRatio < this.config.minUsdcRatio && pairedTokens >= this.config.minTradeSize) {
+      const targetUsdc = this.totalCapital * this.config.targetUsdcRatio;
+      const neededUsdc = targetUsdc - usdc;
+      const mergeAmount = Math.min(neededUsdc * 0.5, pairedTokens * 0.5);
+      if (mergeAmount >= this.config.minTradeSize) {
+        return {
+          type: 'merge',
+          amount: Math.floor(mergeAmount * 100) / 100,
+          reason: `USDC ${(usdcRatio * 100).toFixed(0)}% < ${(this.config.minUsdcRatio * 100).toFixed(0)}% min`,
+          priority: 50,
+        };
+      }
+    }
+
+    return { type: 'none', amount: 0, reason: 'Balanced', priority: 0 };
+  }
+
+  /**
+   * Execute a rebalance action
+   */
+  async rebalance(action?: RebalanceAction): Promise<RebalanceResult> {
+    if (!this.ctf || !this.tradingClient || !this.market) {
+      return {
+        success: false,
+        action: action || { type: 'none', amount: 0, reason: 'No trading config', priority: 0 },
+        error: 'Trading not configured',
+      };
+    }
+
+    const rebalanceAction = action || this.calculateRebalanceAction();
+    if (rebalanceAction.type === 'none') {
+      return { success: true, action: rebalanceAction };
+    }
+
+    this.log(`\n🔄 Rebalance: ${rebalanceAction.type.toUpperCase()} ${rebalanceAction.amount.toFixed(2)}`);
+    this.log(`   Reason: ${rebalanceAction.reason}`);
+
+    try {
+      let txHash: string | undefined;
+
+      switch (rebalanceAction.type) {
+        case 'split': {
+          const result = await this.ctf.split(this.market.conditionId, rebalanceAction.amount.toString());
+          txHash = result.txHash;
+          this.log(`   ✅ Split TX: ${txHash}`);
+          break;
+        }
+        case 'merge': {
+          const tokenIds: TokenIds = {
+            yesTokenId: this.market.yesTokenId,
+            noTokenId: this.market.noTokenId,
+          };
+          const result = await this.ctf.mergeByTokenIds(
+            this.market.conditionId,
+            tokenIds,
+            rebalanceAction.amount.toString()
+          );
+          txHash = result.txHash;
+          this.log(`   ✅ Merge TX: ${txHash}`);
+          break;
+        }
+        case 'sell_yes': {
+          const result = await this.tradingClient.createMarketOrder({
+            tokenId: this.market.yesTokenId,
+            side: 'SELL',
+            amount: rebalanceAction.amount,
+            orderType: 'FOK',
+          });
+          if (!result.success) {
+            throw new Error(result.errorMsg || 'Sell YES failed');
+          }
+          this.log(`   ✅ Sold ${rebalanceAction.amount.toFixed(2)} YES tokens`);
+          break;
+        }
+        case 'sell_no': {
+          const result = await this.tradingClient.createMarketOrder({
+            tokenId: this.market.noTokenId,
+            side: 'SELL',
+            amount: rebalanceAction.amount,
+            orderType: 'FOK',
+          });
+          if (!result.success) {
+            throw new Error(result.errorMsg || 'Sell NO failed');
+          }
+          this.log(`   ✅ Sold ${rebalanceAction.amount.toFixed(2)} NO tokens`);
+          break;
+        }
+      }
+
+      await this.updateBalance();
+      const rebalanceResult: RebalanceResult = { success: true, action: rebalanceAction, txHash };
+      this.emit('rebalance', rebalanceResult);
+      return rebalanceResult;
+    } catch (error: any) {
+      this.log(`   ❌ Failed: ${error.message}`);
+      const rebalanceResult: RebalanceResult = {
+        success: false,
+        action: rebalanceAction,
+        error: error.message,
+      };
+      this.emit('rebalance', rebalanceResult);
+      return rebalanceResult;
+    }
+  }
+
+  // ===== Settle Position Methods =====
+
+  /**
+   * Settle a market position - merge paired tokens to recover USDC
+   * @param market Market to settle (defaults to current market)
+   * @param execute If true, execute the merge. If false, just return info.
+   */
+  async settlePosition(market?: ArbitrageMarketConfig, execute = false): Promise<SettleResult> {
+    const targetMarket = market || this.market;
+    if (!targetMarket) {
+      throw new Error('No market specified');
+    }
+
+    if (!this.ctf) {
+      return {
+        market: targetMarket,
+        yesBalance: 0,
+        noBalance: 0,
+        pairedTokens: 0,
+        unpairedYes: 0,
+        unpairedNo: 0,
+        merged: false,
+        error: 'CTF client not configured',
+      };
+    }
+
+    const tokenIds: TokenIds = {
+      yesTokenId: targetMarket.yesTokenId,
+      noTokenId: targetMarket.noTokenId,
+    };
+
+    // Get token balances
+    const positions = await this.ctf.getPositionBalanceByTokenIds(targetMarket.conditionId, tokenIds);
+    const yesBalance = parseFloat(positions.yesBalance);
+    const noBalance = parseFloat(positions.noBalance);
+
+    const pairedTokens = Math.min(yesBalance, noBalance);
+    const unpairedYes = yesBalance - pairedTokens;
+    const unpairedNo = noBalance - pairedTokens;
+
+    this.log(`\n📊 Position: ${targetMarket.name}`);
+    this.log(`   YES: ${yesBalance.toFixed(6)}`);
+    this.log(`   NO: ${noBalance.toFixed(6)}`);
+    this.log(`   Paired: ${pairedTokens.toFixed(6)} (can merge → $${pairedTokens.toFixed(2)} USDC)`);
+
+    if (unpairedYes > 0.001) {
+      this.log(`   ⚠️ Unpaired YES: ${unpairedYes.toFixed(6)}`);
+    }
+    if (unpairedNo > 0.001) {
+      this.log(`   ⚠️ Unpaired NO: ${unpairedNo.toFixed(6)}`);
+    }
+
+    const result: SettleResult = {
+      market: targetMarket,
+      yesBalance,
+      noBalance,
+      pairedTokens,
+      unpairedYes,
+      unpairedNo,
+      merged: false,
+    };
+
+    // Execute merge if requested and we have enough pairs
+    if (execute && pairedTokens >= 1) {
+      const mergeAmount = Math.floor(pairedTokens * 1e6) / 1e6;
+      this.log(`\n🔄 Merging ${mergeAmount.toFixed(6)} token pairs...`);
+
+      try {
+        const mergeResult = await this.ctf.mergeByTokenIds(
+          targetMarket.conditionId,
+          tokenIds,
+          mergeAmount.toString()
+        );
+        result.merged = true;
+        result.mergeAmount = mergeAmount;
+        result.mergeTxHash = mergeResult.txHash;
+        result.usdcRecovered = mergeAmount;
+        this.log(`   ✅ Merge TX: ${mergeResult.txHash}`);
+        this.log(`   ✅ Recovered: $${mergeAmount.toFixed(2)} USDC`);
+      } catch (error: any) {
+        result.error = error.message;
+        this.log(`   ❌ Merge failed: ${error.message}`);
+      }
+    } else if (pairedTokens >= 1) {
+      this.log(`   💡 Run settlePosition(market, true) to recover $${pairedTokens.toFixed(2)} USDC`);
+    }
+
+    this.emit('settle', result);
+    return result;
+  }
+
+  /**
+   * Settle multiple markets at once
+   */
+  async settleMultiple(markets: ArbitrageMarketConfig[], execute = false): Promise<SettleResult[]> {
+    const results: SettleResult[] = [];
+    let totalMerged = 0;
+    let totalUnpairedYes = 0;
+    let totalUnpairedNo = 0;
+
+    for (const market of markets) {
+      const result = await this.settlePosition(market, execute);
+      results.push(result);
+      if (result.usdcRecovered) totalMerged += result.usdcRecovered;
+      totalUnpairedYes += result.unpairedYes;
+      totalUnpairedNo += result.unpairedNo;
+    }
+
+    this.log(`\n═══════════════════════════════════════`);
+    this.log(`SUMMARY: ${markets.length} markets`);
+    if (execute) {
+      this.log(`Total Merged: $${totalMerged.toFixed(2)} USDC`);
+    }
+    if (totalUnpairedYes > 0.001 || totalUnpairedNo > 0.001) {
+      this.log(`Unpaired YES: ${totalUnpairedYes.toFixed(6)}`);
+      this.log(`Unpaired NO: ${totalUnpairedNo.toFixed(6)}`);
+    }
+
+    return results;
+  }
+
   // ===== Private Methods =====
 
   private handleBookUpdate(update: BookUpdate): void {
@@ -470,6 +826,17 @@ export class ArbitrageService extends EventEmitter {
           });
         }
       }
+    }
+  }
+
+  private async checkAndRebalance(): Promise<void> {
+    if (!this.isRunning || this.isExecuting) return;
+
+    await this.updateBalance();
+    const action = this.calculateRebalanceAction();
+
+    if (action.type !== 'none' && action.amount >= this.config.minTradeSize) {
+      await this.rebalance(action);
     }
   }
 

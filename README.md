@@ -43,6 +43,9 @@ if (arb) {
 │  │ - sell det. │ │ - signals   │ │- price cache  │ │   - ERC1155 approvals   ││
 │  └─────────────┘ └─────────────┘ └───────────────┘ └─────────────────────────┘│
 │  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │ ArbitrageService: Real-time arbitrage detection, rebalancer, settlement │  │
+│  └─────────────────────────────────────────────────────────────────────────┘  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
 │  │ SwapService: DEX swaps on Polygon (QuickSwap V3, USDC/USDC.e conversion)│  │
 │  └─────────────────────────────────────────────────────────────────────────┘  │
 ├──────────────────────────────────────────────────────────────────────────────┤
@@ -695,32 +698,48 @@ for (const allowance of status.erc20Allowances) {
 }
 ```
 
-### ArbitrageService - Real-time Arbitrage Detection & Execution
+### ArbitrageService - Real-time Arbitrage Detection, Execution & Position Management
 
-Automated arbitrage monitoring using WebSocket for real-time orderbook updates.
+Automated arbitrage monitoring using WebSocket for real-time orderbook updates, with built-in rebalancer and settlement features.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  ArbitrageService 套利策略                                                    │
+│  ArbitrageService 核心功能                                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  Long Arb:  effectiveBuyYes + effectiveBuyNo < $1                           │
-│             → Buy YES + NO → Merge → $1 USDC                                │
+│  1. 套利检测与执行                                                            │
+│     - Long Arb:  effectiveBuyYes + effectiveBuyNo < $1 → Merge              │
+│     - Short Arb: effectiveSellYes + effectiveSellNo > $1 → Sell             │
 │                                                                             │
-│  Short Arb: effectiveSellYes + effectiveSellNo > $1                         │
-│             → Sell pre-held YES + NO tokens → > $1 USDC                     │
+│  2. 自动再平衡 (Rebalancer)                                                   │
+│     - 保持 USDC 在设定范围内 (默认 20%-80%)                                     │
+│     - ⚠️ 关键: 保持 YES = NO (风险控制，避免方向性敞口)                          │
+│     - 自动 Split/Merge 调整仓位                                               │
+│                                                                             │
+│  3. 仓位清算 (Settle)                                                         │
+│     - 批量查看多市场持仓                                                       │
+│     - Merge 配对代币回收 USDC                                                 │
+│     - 追踪未配对代币 (等待市场结算后 redeem)                                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+#### Basic Usage
 
 ```typescript
 import { ArbitrageService } from '@catalyst-team/poly-sdk';
 
-// Initialize service
+// Initialize service with rebalancer
 const arbService = new ArbitrageService({
   privateKey: process.env.POLY_PRIVKEY,
   profitThreshold: 0.005,  // 0.5% minimum profit
   minTradeSize: 5,         // $5 minimum
   maxTradeSize: 100,       // $100 maximum
   autoExecute: true,       // Automatically execute opportunities
+  // Rebalancer config
+  enableRebalancer: true,  // Auto-rebalance position
+  minUsdcRatio: 0.2,       // Min 20% USDC (Split if below)
+  maxUsdcRatio: 0.8,       // Max 80% USDC (Merge if above)
+  targetUsdcRatio: 0.5,    // Target 50% when rebalancing
+  imbalanceThreshold: 5,   // Max YES-NO difference before fix
 });
 
 // Define market to monitor
@@ -732,49 +751,63 @@ const market = {
   outcomes: ['Yes', 'No'] as [string, string],
 };
 
-// Listen for opportunities
+// Listen for events
 arbService.on('opportunity', (opp) => {
   console.log(`${opp.type.toUpperCase()} ARB: ${opp.profitPercent.toFixed(2)}%`);
-  console.log(`Size: ${opp.recommendedSize}, Est Profit: $${opp.estimatedProfit.toFixed(2)}`);
 });
 
-// Listen for execution results
 arbService.on('execution', (result) => {
   if (result.success) {
-    console.log(`✅ Executed: $${result.profit.toFixed(2)} profit in ${result.executionTimeMs}ms`);
-  } else {
-    console.log(`❌ Failed: ${result.error}`);
+    console.log(`✅ Executed: $${result.profit.toFixed(2)} profit`);
   }
+});
+
+arbService.on('rebalance', (result) => {
+  console.log(`🔄 Rebalance: ${result.action.type} ${result.action.amount}`);
 });
 
 // Start monitoring
 await arbService.start(market);
-
-// ... later
-await arbService.stop();
-console.log(arbService.getStats()); // { opportunitiesDetected, executionsSucceeded, totalProfit }
 ```
 
-**Manual Execution Mode:**
+#### Manual Rebalancing
 
 ```typescript
-// Initialize without autoExecute
-const arbService = new ArbitrageService({
-  privateKey: process.env.POLY_PRIVKEY,
-  autoExecute: false,  // Manual mode
-});
+// Check current rebalance recommendation
+const action = arbService.calculateRebalanceAction();
+console.log(`Recommended: ${action.type} ${action.amount} (${action.reason})`);
 
-await arbService.start(market);
-
-// Check for opportunity
-const opportunity = arbService.checkOpportunity();
-if (opportunity && opportunity.profitPercent > 1.0) {
-  // Execute manually with custom logic
-  const result = await arbService.execute(opportunity);
+// Execute rebalance manually
+if (action.type !== 'none') {
+  const result = await arbService.rebalance(action);
+  console.log(`Rebalance: ${result.success ? '✅' : '❌'} ${result.action.type}`);
 }
 ```
 
-**Monitor-only Mode (no wallet):**
+#### Settle Positions (Recover USDC)
+
+```typescript
+// View position without executing
+const info = await arbService.settlePosition(market, false);
+console.log(`Paired tokens: ${info.pairedTokens} (can recover $${info.pairedTokens})`);
+console.log(`Unpaired YES: ${info.unpairedYes}`);
+console.log(`Unpaired NO: ${info.unpairedNo}`);
+
+// Execute merge to recover USDC
+const result = await arbService.settlePosition(market, true);
+if (result.merged) {
+  console.log(`Recovered: $${result.usdcRecovered} USDC`);
+  console.log(`TX: ${result.mergeTxHash}`);
+}
+
+// Settle multiple markets at once
+const markets = [market1, market2, market3];
+const results = await arbService.settleMultiple(markets, true);
+const totalRecovered = results.reduce((sum, r) => sum + (r.usdcRecovered || 0), 0);
+console.log(`Total recovered: $${totalRecovered}`);
+```
+
+#### Monitor-only Mode (no wallet)
 
 ```typescript
 // No private key = monitoring only
@@ -784,7 +817,6 @@ const arbService = new ArbitrageService({
 });
 
 arbService.on('opportunity', (opp) => {
-  // Log opportunities without executing
   console.log(`Found: ${opp.description}`);
 });
 
@@ -920,6 +952,9 @@ import type {
   ArbitrageExecutionResult,
   OrderbookState,
   BalanceState,
+  RebalanceAction,
+  RebalanceResult,
+  SettleResult,
 
   // Price Utils
   TickSize,
