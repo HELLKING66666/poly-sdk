@@ -171,19 +171,19 @@ export interface Position {
 
 ### 执行步骤
 
-#### Phase 1: 基础类型统一 (HIGH PRIORITY)
+#### Phase 1: 基础类型统一 (HIGH PRIORITY) ✅
 
-- [ ] Step 1: 将 `Side`, `OrderType` 移到 core/types.ts
-- [ ] Step 2: 更新 trading-service.ts 从 core/types.ts 导入
-- [ ] Step 3: 更新 market-service.ts 从 core/types.ts 导入
-- [ ] Step 4: 更新 index.ts 的导出
+- [x] Step 1: 将 `Side`, `OrderType` 移到 core/types.ts
+- [x] Step 2: 更新 trading-service.ts 从 core/types.ts 导入
+- [x] Step 3: 更新 market-service.ts 从 core/types.ts 导入
+- [x] Step 4: 更新 index.ts 的导出
 
-#### Phase 2: Orderbook 类型合并 (MEDIUM PRIORITY)
+#### Phase 2: Orderbook 类型合并 (MEDIUM PRIORITY) ✅
 
-- [ ] Step 5: 在 core/types.ts 创建统一的 `Orderbook` 接口
-- [ ] Step 6: 更新 market-service.ts 使用统一类型
-- [ ] Step 7: 更新 realtime-service-v2.ts 使用统一类型
-- [ ] Step 8: 删除 `OrderbookSnapshot`，使用 `Orderbook`
+- [x] Step 5: 在 core/types.ts 创建统一的 `Orderbook` 接口
+- [x] Step 6: 更新 market-service.ts 使用统一类型
+- [x] Step 7: 更新 realtime-service-v2.ts 使用统一类型
+- [x] Step 8: OrderbookSnapshot 现在 extends Orderbook (保留扩展字段)
 
 #### Phase 3: Trade 类型整理 (MEDIUM PRIORITY)
 
@@ -223,17 +223,21 @@ export interface Position {
 
 ## 验证清单
 
-### 文档重构
-- [ ] 所有文档都有明确的目标读者
-- [ ] 没有重复内容
-- [ ] 导航 README 包含所有文档
-- [ ] 交叉引用链接都正确
+### 文档重构 ✅
+- [x] 所有文档都有明确的目标读者
+- [x] 没有重复内容
+- [x] 导航 README 包含所有文档
+- [x] 交叉引用链接都正确
 
-### 数据模型
-- [ ] core/types.ts 是 single source of truth
-- [ ] 没有重复的类型定义
-- [ ] TypeScript 编译通过
-- [ ] 所有 examples 正常运行
+### 数据模型 (Phase 1-2) ✅
+- [x] core/types.ts 是 single source of truth (Side, OrderType, Orderbook)
+- [x] 没有重复的类型定义 (Phase 1-2 范围内)
+- [x] TypeScript 编译通过
+- [ ] 所有 examples 正常运行 (待验证)
+
+### 待完成 (Phase 3-4)
+- [ ] Trade 类型整理
+- [ ] Market 类型整理
 
 ---
 
