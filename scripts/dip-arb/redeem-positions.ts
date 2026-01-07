@@ -10,7 +10,7 @@
 
 import { PolymarketSDK, CTFClient } from '../../src/index.js';
 
-const PRIVATE_KEY = process.env.PRIVATE_KEY || '0x534f580d171686a880db4a5b09fc5981df16073f016c933b3e92ce3bc049019d';
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
 
 // Normalize outcome names: Up/Yes = YES, Down/No = NO
 function normalizeOutcome(outcome: string): 'YES' | 'NO' {

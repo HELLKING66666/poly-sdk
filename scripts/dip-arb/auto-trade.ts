@@ -27,21 +27,57 @@ import { PolymarketSDK } from '../../src/index.js';
 
 type CoinType = 'BTC' | 'ETH' | 'SOL' | 'XRP';
 
-function parseCoin(): CoinType {
-  const args = process.argv.slice(2);
-
-  if (args.includes('--btc') || args.includes('-b')) return 'BTC';
-  if (args.includes('--eth') || args.includes('-e')) return 'ETH';
-  if (args.includes('--sol') || args.includes('-s')) return 'SOL';
-  if (args.includes('--xrp') || args.includes('-x')) return 'XRP';
-
-  // Default to ETH if no argument provided
-  console.log('No coin specified, defaulting to ETH');
-  console.log('Usage: npx tsx scripts/dip-arb/auto-trade.ts [--btc|-b] [--eth|-e] [--sol|-s] [--xrp|-x]');
-  return 'ETH';
+interface CliArgs {
+  coin: CoinType;
+  dipThreshold: number;      // 跌幅阈值 (0.30 = 30%)
+  slidingWindowMs: number;   // 滑动窗口 (毫秒)
+  leg2TimeoutSeconds: number; // 止损时间 (秒)
+  sumTarget: number;         // 总成本目标
+  shares: number;            // 每次交易份数
 }
 
-const SELECTED_COIN = parseCoin();
+function parseArgs(): CliArgs {
+  const args = process.argv.slice(2);
+
+  // 解析币种
+  let coin: CoinType = 'ETH';
+  if (args.includes('--btc') || args.includes('-b')) coin = 'BTC';
+  else if (args.includes('--eth') || args.includes('-e')) coin = 'ETH';
+  else if (args.includes('--sol') || args.includes('-s')) coin = 'SOL';
+  else if (args.includes('--xrp') || args.includes('-x')) coin = 'XRP';
+
+  // 解析数值参数
+  const getArgValue = (name: string, defaultVal: number): number => {
+    const arg = args.find(a => a.startsWith(`--${name}=`));
+    if (arg) {
+      const val = parseFloat(arg.split('=')[1]);
+      return isNaN(val) ? defaultVal : val;
+    }
+    return defaultVal;
+  };
+
+  // 币种默认参数
+  const coinDefaults: Record<CoinType, Partial<CliArgs>> = {
+    XRP: { dipThreshold: 0.40, slidingWindowMs: 3000, leg2TimeoutSeconds: 60, sumTarget: 0.85 },
+    SOL: { dipThreshold: 0.40, slidingWindowMs: 3000, leg2TimeoutSeconds: 60, sumTarget: 0.85 },
+    ETH: { dipThreshold: 0.30, slidingWindowMs: 5000, leg2TimeoutSeconds: 60, sumTarget: 0.93 },
+    BTC: { dipThreshold: 0.20, slidingWindowMs: 5000, leg2TimeoutSeconds: 60, sumTarget: 0.95 },
+  };
+
+  const defaults = coinDefaults[coin];
+
+  return {
+    coin,
+    dipThreshold: getArgValue('dip', defaults.dipThreshold!),
+    slidingWindowMs: getArgValue('window', defaults.slidingWindowMs!),
+    leg2TimeoutSeconds: getArgValue('timeout', defaults.leg2TimeoutSeconds!),
+    sumTarget: getArgValue('target', defaults.sumTarget!),
+    shares: getArgValue('shares', 25),
+  };
+}
+
+const CLI_ARGS = parseArgs();
+const SELECTED_COIN = CLI_ARGS.coin;
 
 // Config
 const PRIVATE_KEY = process.env.PRIVATE_KEY || '';
@@ -119,28 +155,28 @@ async function main() {
   // Configuration
   // ========================================
   const config = {
-    // 交易参数
-    shares: 25,             // 每次交易总份数 (最低 100 确保 $1 最低限额: 100 × $0.01 = $1)
-    sumTarget: 0.95,         // 放宽到 0.95 提高 Leg2 成交率 (5%+ 利润)
+    // 交易参数 (支持命令行覆盖)
+    shares: CLI_ARGS.shares,           // --shares=25
+    sumTarget: CLI_ARGS.sumTarget,     // --target=0.95
 
     // 订单拆分参数
-    splitOrders: 1,          // ✅ 改为 1，避免份额不匹配问题
+    splitOrders: 1,          // 单笔下单，避免份额不匹配
     orderIntervalMs: 500,    // 订单间隔 500ms (仅在 splitOrders > 1 时使用)
 
-    // 信号检测参数
-    slidingWindowMs: 10000,  // 10 秒滑动窗口
-    dipThreshold: 0.20,      // 20% 跌幅触发 Leg1
+    // 信号检测参数 (支持命令行覆盖)
+    slidingWindowMs: CLI_ARGS.slidingWindowMs,  // --window=10000 (毫秒)
+    dipThreshold: CLI_ARGS.dipThreshold,        // --dip=0.30 (30%)
     windowMinutes: 14,       // 轮次开始后 14 分钟内可交易
 
     // 执行参数
-    maxSlippage: 0.02,       // ✅ 提高到 3% 滑点，确保成交
+    maxSlippage: 0.02,       // 2% 滑点
     autoExecute: true,       // 自动执行
     executionCooldown: 500,  // 冷却时间 500ms
 
     // 其他
     enableSurge: false,      // 禁用暴涨检测
     autoMerge: true,         // 自动 merge
-    leg2TimeoutSeconds: 9999, // 禁用止损：持有到期，等待市场结算后自动赎回
+    leg2TimeoutSeconds: CLI_ARGS.leg2TimeoutSeconds,  // --timeout=60 (秒)
 
     debug: true,             // 调试日志
 
@@ -160,9 +196,13 @@ async function main() {
   log('╠══════════════════════════════════════════════════════════╣');
   log(`║  Dip Threshold:   ${(config.dipThreshold * 100).toFixed(0)}% in ${config.slidingWindowMs / 1000}s window                    ║`);
   log(`║  Sum Target:      ${config.sumTarget} (profit >= ${expectedProfit}%)                   ║`);
-  log(`║  Auto Execute:    ${config.autoExecute ? 'YES' : 'NO'}                                        ║`);
+  log(`║  Stop Loss:       ${config.leg2TimeoutSeconds}s after Leg1                             ║`);
+  log(`║  Shares/Trade:    ${config.shares}                                          ║`);
+  log(`║  Order Type:      Market Order (Leg1 + Leg2 + Exit)              ║`);
   log(`║  Log Directory:   ${LOG_DIR}`);
   log('╚══════════════════════════════════════════════════════════╝');
+  log('');
+  log('Usage: npx tsx auto-trade.ts --xrp [--dip=0.40] [--window=3000] [--timeout=60] [--shares=25] [--target=0.95]');
   log('');
 
   // Initialize SDK

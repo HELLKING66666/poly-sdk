@@ -48,6 +48,15 @@ const CLOB_HOST = 'https://clob.polymarket.com';
 // Chain IDs
 export const POLYGON_MAINNET = 137;
 
+/**
+ * Normalize timestamp to milliseconds.
+ * Polymarket API sometimes returns timestamps in seconds.
+ * Timestamps < 1e12 (year ~2001 in ms) are assumed to be in seconds.
+ */
+function normalizeTimestamp(ts: number): number {
+  return ts < 1e12 ? ts * 1000 : ts;
+}
+
 // Mapping from underlying asset to Binance symbol
 const UNDERLYING_TO_SYMBOL = {
   BTC: 'BTCUSDT',
@@ -852,14 +861,19 @@ export class MarketService {
 
   /**
    * Aggregate trades into K-Line candles
+   *
+   * Note: Polymarket API may return timestamps in seconds or milliseconds.
+   * This function normalizes all timestamps to milliseconds for consistent handling.
    */
   private aggregateToKLines(trades: Trade[], interval: KLineInterval): KLineCandle[] {
     const intervalMs = getIntervalMs(interval);
     const buckets = new Map<number, Trade[]>();
 
     // Group trades into time buckets
+    // Normalize timestamp to milliseconds (API sometimes returns seconds)
     for (const trade of trades) {
-      const bucketTime = Math.floor(trade.timestamp / intervalMs) * intervalMs;
+      const tradeTs = normalizeTimestamp(trade.timestamp);
+      const bucketTime = Math.floor(tradeTs / intervalMs) * intervalMs;
       const bucket = buckets.get(bucketTime) || [];
       bucket.push(trade);
       buckets.set(bucketTime, bucket);
@@ -870,8 +884,8 @@ export class MarketService {
     for (const [timestamp, bucketTrades] of buckets) {
       if (bucketTrades.length === 0) continue;
 
-      // Sort by timestamp for correct open/close
-      bucketTrades.sort((a, b) => a.timestamp - b.timestamp);
+      // Sort by normalized timestamp for correct open/close
+      bucketTrades.sort((a, b) => normalizeTimestamp(a.timestamp) - normalizeTimestamp(b.timestamp));
 
       const prices = bucketTrades.map((t) => t.price);
       const buyTrades = bucketTrades.filter((t) => t.side === 'BUY');
