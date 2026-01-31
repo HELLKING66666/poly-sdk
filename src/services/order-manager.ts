@@ -1319,7 +1319,13 @@ export class OrderManager extends EventEmitter {
 
     // Bug 16 Fix: When we're the maker, use maker-specific matchedSize and price
     // userTrade.size is the TOTAL trade size (sum of all makers), not our individual fill
-    const fillSize = makerInfo?.matchedSize ?? userTrade.size;
+    // Bug 20 Fix: If matchedSize is 0 (undefined in payload), fall back to trade size
+    // This happens when we're the only maker in the trade
+    let fillSize = makerInfo?.matchedSize ?? userTrade.size;
+    if (makerInfo && fillSize === 0 && userTrade.makerOrders?.length === 1) {
+      // We're the only maker, use total trade size
+      fillSize = userTrade.size;
+    }
     const fillPrice = makerInfo?.price ?? userTrade.price;
 
     console.log(`[OrderManager] USER_TRADE fill details:`, {
