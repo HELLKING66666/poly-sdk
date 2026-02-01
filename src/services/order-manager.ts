@@ -187,7 +187,7 @@ import type { RealtimeServiceV2, UserOrder, UserTrade, MakerOrderInfo } from './
 import { RateLimiter } from '../core/rate-limiter.js';
 import { createUnifiedCache } from '../core/unified-cache.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
-import { OrderStatus } from '../core/types.js';
+import { OrderStatus, type Side } from '../core/types.js';
 import { mapApiStatusToInternal, isTerminalStatus, isValidStatusTransition } from '../core/order-status.js';
 import { PolymarketError, ErrorCode } from '../core/errors.js';
 
@@ -225,6 +225,12 @@ interface WatchedOrder {
   lastStatus: OrderStatus;
   /** Polling interval ID (if in polling mode) */
   pollingIntervalId?: NodeJS.Timeout;
+  /**
+   * Bug 24 fix: Preserve the original tokenId set at order creation.
+   * Polling updates can potentially return wrong tokenId (API race condition),
+   * so we use this to protect the tokenId from being overwritten.
+   */
+  initialTokenId?: string;
 }
 
 /**
@@ -684,7 +690,10 @@ export class OrderManager extends EventEmitter {
     this.config = {
       ...config,
       chainId: config.chainId ?? 137,
-      mode: config.mode ?? 'hybrid',
+      // Bug 24 fix: Default to 'websocket' mode instead of 'hybrid'
+      // Polling mechanism can update watched orders with incorrect tokenId,
+      // causing fill events to be processed with wrong token type
+      mode: config.mode ?? 'websocket',
       pollingInterval: config.pollingInterval ?? 5000,
       polygonRpcUrl: config.polygonRpcUrl ?? 'https://polygon-rpc.com',
     };
@@ -805,8 +814,13 @@ export class OrderManager extends EventEmitter {
     const result = await this.tradingService.createLimitOrder(params);
 
     if (result.success && result.orderId) {
-      // Auto-watch the order
-      this.watchOrder(result.orderId, metadata);
+      // Auto-watch the order with initial order info (Bug 24 fix)
+      this.watchOrder(result.orderId, metadata, {
+        tokenId: params.tokenId,
+        side: params.side,
+        price: params.price,
+        size: params.size,
+      });
 
       // Emit order_created event
       this.emit('order_created', {
@@ -872,11 +886,20 @@ export class OrderManager extends EventEmitter {
     const result = await this.tradingService.createMarketOrder(params);
 
     if (result.success && result.orderId) {
-      // Auto-watch the order
-      this.watchOrder(result.orderId, {
-        ...metadata,
-        orderType: params.orderType || 'FOK', // Track order type for lifecycle handling
-      });
+      // Auto-watch the order with initial order info (Bug 24 fix)
+      this.watchOrder(
+        result.orderId,
+        {
+          ...metadata,
+          orderType: params.orderType || 'FOK', // Track order type for lifecycle handling
+        },
+        {
+          tokenId: params.tokenId,
+          side: params.side,
+          price: params.price,
+          size: params.amount,
+        }
+      );
 
       // Emit order_created event
       this.emit('order_created', {
@@ -1031,34 +1054,42 @@ export class OrderManager extends EventEmitter {
   // ============================================================================
 
   /**
-   * Manually watch an order
-   * Used for monitoring externally-created orders
+   * Watch an order by ID
    *
-   * @param orderId Order ID to watch
-   * @param metadata Optional metadata
+   * @param orderId - Order ID to watch
+   * @param metadata - Optional metadata for strategy context
+   * @param initialOrderInfo - Optional initial order info (tokenId, side, price, size)
+   *                           to avoid relying on polling for accurate token type
    */
-  watchOrder(orderId: string, metadata?: OrderMetadata): void {
+  watchOrder(
+    orderId: string,
+    metadata?: OrderMetadata,
+    initialOrderInfo?: { tokenId?: string; side?: Side; price?: number; size?: number }
+  ): void {
     if (this.watchedOrders.has(orderId)) {
       return; // Already watching
     }
 
     // Create initial watched state
+    // Bug 24 fix: Use initialOrderInfo if provided to ensure correct tokenId
     const watched: WatchedOrder = {
       orderId,
       order: {
         id: orderId,
         status: OrderStatus.PENDING,
-        tokenId: '',
-        side: 'BUY',
-        price: 0,
-        originalSize: 0,
+        tokenId: initialOrderInfo?.tokenId || '',
+        side: initialOrderInfo?.side || 'BUY',
+        price: initialOrderInfo?.price || 0,
+        originalSize: initialOrderInfo?.size || 0,
         filledSize: 0,
-        remainingSize: 0,
+        remainingSize: initialOrderInfo?.size || 0,
         associateTrades: [],
         createdAt: Date.now(),
       },
       metadata,
       lastStatus: OrderStatus.PENDING,
+      // Bug 24 fix: Store initialTokenId to protect from polling overwrites
+      initialTokenId: initialOrderInfo?.tokenId,
     };
 
     this.watchedOrders.set(orderId, watched);
