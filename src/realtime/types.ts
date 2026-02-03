@@ -78,9 +78,12 @@ export type MarketEventType =
   | 'market_resolved'; // Market resolved - feature-flagged, triggered on market resolution
 
 /**
- * Orderbook level (bid or ask)
+ * Raw orderbook level from WebSocket API (string format)
+ *
+ * Note: WebSocket API returns numbers as strings for precision.
+ * Use OrderbookLevel from core/types.ts for parsed number format.
  */
-export interface OrderbookLevel {
+export interface RawOrderbookLevel {
   price: string;
   size: string;
 }
@@ -98,9 +101,9 @@ export interface BookEventPayload {
   /** Orderbook hash for change detection */
   hash: string;
   /** Buy orders (bids) - sorted by price descending */
-  bids: OrderbookLevel[];
+  bids: RawOrderbookLevel[];
   /** Sell orders (asks) - sorted by price ascending */
-  asks: OrderbookLevel[];
+  asks: RawOrderbookLevel[];
   /** Timestamp in milliseconds */
   timestamp: string | number;
   /** Minimum tick size for orders */

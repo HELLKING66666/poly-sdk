@@ -39,7 +39,7 @@ export {
 
 // Market Channel Event Payloads
 export {
-  type OrderbookLevel,
+  type RawOrderbookLevel,
   type BookEventPayload,
   type PriceChangeEntry,
   type PriceChangeEventPayload,
