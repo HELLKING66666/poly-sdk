@@ -1,6 +1,6 @@
 {
   "name": "@hellking66666/poly-sdk",
-  "version": "0.4.7",
+  "version": "0.4.9",
   "private": false,
   "license": "MIT",
   "description": "TypeScript SDK for Polymarket - prediction markets trading, smart money analysis, and market data",

@@ -954,9 +954,6 @@ export class SmartMoneyService {
     const maxSizePerTrade = options.maxSizePerTrade ?? 50;
     const maxSlippage = options.maxSlippage ?? 0.03;
     const orderType = options.orderType ?? 'FOK';
-    const minTradeSize = options.minTradeSize ?? 10;
-    const maxPriceSize = options.maxPriceSize ?? 100;
-    const minPriceSize = options.minPriceSize ?? 1;
     const sideFilter = options.sideFilter;
     const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
@@ -974,17 +971,20 @@ export class SmartMoneyService {
 
           // Filters
           const tradeValue = trade.size * trade.price;
-          if (tradeValue < minTradeSize) {
+          if (options.minTradeSize !== undefined && tradeValue < options.minTradeSize) {
+            console.log('[SmartMoneyService] Trade value below minimum:', tradeValue, 'Minimum:', options.minTradeSize);
             stats.tradesSkipped++;
             return;
           }
 
-          if (trade.price > maxPriceSize) {
+          if (options.maxPriceSize !== undefined && trade.price > options.maxPriceSize) {
+            console.log('[SmartMoneyService] Trade price above maximum:', trade.price, 'Maximum:', options.maxPriceSize);
             stats.tradesSkipped++;
             return;
           }
 
-          if (trade.price < minPriceSize) {
+          if (options.minPriceSize !== undefined && trade.price < options.minPriceSize) {
+            console.log('[SmartMoneyService] Trade price below minimum:', trade.price, 'Minimum:', options.minPriceSize);
             stats.tradesSkipped++;
             return;
           }
@@ -1070,7 +1070,7 @@ export class SmartMoneyService {
           options.onError?.(error instanceof Error ? error : new Error(String(error)));
         }
       },
-      { filterAddresses: targetAddresses, minSize: minTradeSize }
+      { filterAddresses: targetAddresses }
     );
 
     return {

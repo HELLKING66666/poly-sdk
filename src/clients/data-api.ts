@@ -798,6 +798,13 @@ export class DataApiClient {
    * const page2 = await client.fetchLeaderboard({ timePeriod: 'WEEK', limit: 20, offset: 20 });
    * ```
    */
+  /**
+   * Get leaderboard (alias for fetchLeaderboard for SDK/docs compatibility).
+   */
+  async getLeaderboard(params?: LeaderboardParams): Promise<LeaderboardResult> {
+    return this.fetchLeaderboard(params);
+  }
+
   async fetchLeaderboard(params?: LeaderboardParams): Promise<LeaderboardResult> {
     const {
       timePeriod = 'ALL',

@@ -20,7 +20,7 @@ async function main() {
   // 1. Get leaderboard
   console.log('1. Fetching leaderboard (top 10)...');
   const leaderboard = await sdk.dataApi.getLeaderboard({ limit: 10 });
-  console.log(`   Total entries: ${leaderboard.total}`);
+  console.log(`   Total entries: ${leaderboard.entries.length}`);
   console.log('   Top 10 traders:\n');
 
   for (const entry of leaderboard.entries.slice(0, 10)) {
