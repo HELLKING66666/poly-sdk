@@ -1,9 +1,21 @@
 {
-  "extends": "../tsconfig.base.json",
   "compilerOptions": {
+    "target": "ES2020",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2020"],
     "outDir": "./dist",
-    "rootDir": "."
+    "rootDir": ".",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
   },
   "include": ["src/**/*", "scripts/dip-arb/**/*"],
-  "exclude": ["src/wallets/privy-wallet.ts"]
+  "exclude": ["node_modules", "dist", "src/wallets/privy-wallet.ts"]
 }

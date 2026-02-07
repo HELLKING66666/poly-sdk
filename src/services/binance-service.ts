@@ -85,10 +85,10 @@ const DEFAULT_LIMIT = 500;
 const MAX_LIMIT = 1000;
 
 // Valid symbols
-const VALID_SYMBOLS: Set<BinanceSymbol> = new Set(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']);
+const VALID_SYMBOLS: Set<BinanceSymbol> = new Set<BinanceSymbol>(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']);
 
 // Valid intervals
-const VALID_INTERVALS: Set<BinanceInterval> = new Set([
+const VALID_INTERVALS: Set<BinanceInterval> = new Set<BinanceInterval>([
   '1m', '5m', '15m', '30m', '1h', '4h', '1d',
 ]);
 

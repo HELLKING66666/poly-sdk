@@ -123,6 +123,9 @@ export interface SmartMoneyTrade {
   timestamp: number;
   isSmartMoney: boolean;
   smartMoneyInfo?: SmartMoneyWallet;
+  copySize?: number;
+  copyPrice?: number;
+  copyValue?: number;
 }
 
 /**
@@ -147,6 +150,10 @@ export interface AutoCopyTradingOptions {
 
   /** Minimum trade value to copy (USDC) */
   minTradeSize?: number;
+  /** Maximum price size to copy (USDC) */
+  maxPriceSize?: number;
+  /** Minimum price size to copy (USDC) */
+  minPriceSize?: number;
   /** Only copy BUY or SELL trades */
   sideFilter?: 'BUY' | 'SELL';
 
@@ -948,6 +955,8 @@ export class SmartMoneyService {
     const maxSlippage = options.maxSlippage ?? 0.03;
     const orderType = options.orderType ?? 'FOK';
     const minTradeSize = options.minTradeSize ?? 10;
+    const maxPriceSize = options.maxPriceSize ?? 100;
+    const minPriceSize = options.minPriceSize ?? 1;
     const sideFilter = options.sideFilter;
     const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
@@ -966,6 +975,16 @@ export class SmartMoneyService {
           // Filters
           const tradeValue = trade.size * trade.price;
           if (tradeValue < minTradeSize) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          if (trade.price > maxPriceSize) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          if (trade.price < minPriceSize) {
             stats.tradesSkipped++;
             return;
           }
@@ -1011,8 +1030,14 @@ export class SmartMoneyService {
 
           const usdcAmount = copyValue; // Already calculated above
 
+          // Copy trade info
+          trade.copySize = copySize;
+          trade.copyPrice = slippagePrice;
+          trade.copyValue = usdcAmount;
+
           // Execute
           let result: OrderResult;
+
 
           if (dryRun) {
             result = { success: true, orderId: `dry_run_${Date.now()}` };
@@ -1039,7 +1064,7 @@ export class SmartMoneyService {
             stats.tradesFailed++;
           }
 
-          options.onTrade?.(trade, result);
+          options.onTrade?.(trade, result,);
         } catch (error) {
           stats.tradesFailed++;
           options.onError?.(error instanceof Error ? error : new Error(String(error)));
