@@ -1,21 +1,34 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "lib": ["ES2020"],
+    // Language and Environment
+    "target": "ES2022",
+    "lib": [
+      "ES2022"
+    ],
+    // Module System
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    // Emit
     "outDir": "./dist",
     "rootDir": ".",
-    "strict": true,
-    "skipLibCheck": true,
-    "esModuleInterop": true,
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
+    // Type Checking
+    "strict": true,
+    "skipLibCheck": true,
+    // Interop Constraints
+    "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true,
-    "isolatedModules": true
+    "resolveJsonModule": true
   },
-  "include": ["src/**/*", "scripts/dip-arb/**/*"],
-  "exclude": ["node_modules", "dist", "src/wallets/privy-wallet.ts"]
+  "include": [
+    "src/**/*",
+    "scripts/dip-arb/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/wallets/privy-wallet.ts"
+  ]
 }
