@@ -1,6 +1,6 @@
 {
-  "name": "@catalyst-team/poly-sdk",
-  "version": "0.4.7-alpha.0",
+  "name": "@hellking66666/poly-sdk",
+  "version": "0.4.9-alpha.2",
   "private": false,
   "license": "MIT",
   "description": "TypeScript SDK for Polymarket - prediction markets trading, smart money analysis, and market data",
@@ -43,7 +43,7 @@
     "defi",
     "smart-money"
   ],
-  "author": "Catalyst Team",
+  "author": "hellking66666",
   "files": [
     "dist",
     "README.md",
