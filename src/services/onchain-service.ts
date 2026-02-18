@@ -263,6 +263,20 @@ export class OnchainService {
   }
 
   /**
+   * Split USDC into YES + NO tokens using explicit token IDs
+   *
+   * Supports both standard CTF and NegRisk markets.
+   * For NegRisk: uses NegRisk Adapter → tokens at CLOB token IDs.
+   */
+  async splitByTokenIds(
+    conditionId: string,
+    tokenIds: TokenIds,
+    amount: string
+  ): Promise<SplitResult> {
+    return this.ctfClient.splitByTokenIds(conditionId, tokenIds, amount);
+  }
+
+  /**
    * Merge YES + NO tokens back to USDC
    *
    * @param conditionId - Market condition ID
@@ -276,8 +290,8 @@ export class OnchainService {
   /**
    * Merge YES and NO tokens using explicit token IDs
    *
-   * Use this for Polymarket CLOB markets where token IDs
-   * don't match the calculated position IDs.
+   * Supports both standard CTF and NegRisk markets.
+   * For NegRisk: uses NegRisk Adapter to merge.
    */
   async mergeByTokenIds(
     conditionId: string,
