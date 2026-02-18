@@ -380,7 +380,7 @@ export class CTFClient {
   async merge(conditionId: string, amount: string): Promise<MergeResult> {
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
-    // Check token balances
+    // Check token balances using calculated position IDs
     const balances = await this.getPositionBalance(conditionId);
     const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
     const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
@@ -391,23 +391,49 @@ export class CTFClient {
       );
     }
 
-    // Execute merge
+    // Use safe amount: min(requested, yesBalance, noBalance)
+    let safeAmountWei = amountWei;
+    if (yesBalance.lt(safeAmountWei)) safeAmountWei = yesBalance;
+    if (noBalance.lt(safeAmountWei)) safeAmountWei = noBalance;
+
+    // Dry-run to catch revert reason before submitting actual transaction
+    try {
+      await this.ctfContract.callStatic.mergePositions(
+        USDC_CONTRACT,
+        ethers.constants.HashZero,
+        conditionId,
+        [1, 2],
+        safeAmountWei,
+      );
+    } catch (error: any) {
+      const reason = error?.reason || error?.error?.message || error?.message || 'unknown';
+      throw new Error(
+        `Merge dry-run failed (callStatic reverted): ${reason}. ` +
+        `Amount: ${ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS)}, ` +
+        `YES: ${balances.yesBalance}, NO: ${balances.noBalance}, ` +
+        `conditionId: ${conditionId}`
+      );
+    }
+
+    // Execute merge with explicit gasLimit
+    const gasOptions = await this.getGasOptions();
     const tx = await this.ctfContract.mergePositions(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,
       [1, 2],
-      amountWei,
-      await this.getGasOptions()
+      safeAmountWei,
+      { ...gasOptions, gasLimit: 500000 }
     );
 
     const receipt = await tx.wait();
 
+    const mergedAmount = ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS);
     return {
       success: true,
       txHash: receipt.transactionHash,
-      amount,
-      usdcReceived: amount, // 1:1 merge
+      amount: mergedAmount,
+      usdcReceived: mergedAmount,
       gasUsed: receipt.gasUsed.toString(),
     };
   }
@@ -419,6 +445,10 @@ export class CTFClient {
    * necessary when working with Polymarket CLOB markets where token IDs
    * don't match the calculated position IDs.
    *
+   * For standard CTF markets, CLOB token IDs = calculated position IDs.
+   * For NegRisk markets, they differ — this method detects the mismatch
+   * and verifies balance at the calculated IDs before merging.
+   *
    * @param conditionId - Market condition ID
    * @param tokenIds - Token IDs from CLOB API
    * @param amount - Amount of tokens to merge
@@ -427,7 +457,7 @@ export class CTFClient {
   async mergeByTokenIds(conditionId: string, tokenIds: TokenIds, amount: string): Promise<MergeResult> {
     const amountWei = ethers.utils.parseUnits(amount, USDC_DECIMALS);
 
-    // Check token balances using the provided token IDs
+    // Check token balances using the provided CLOB token IDs
     const balances = await this.getPositionBalanceByTokenIds(conditionId, tokenIds);
     const yesBalance = ethers.utils.parseUnits(balances.yesBalance, USDC_DECIMALS);
     const noBalance = ethers.utils.parseUnits(balances.noBalance, USDC_DECIMALS);
@@ -438,23 +468,76 @@ export class CTFClient {
       );
     }
 
-    // Execute merge
+    // Detect NegRisk: compare CLOB token IDs with calculated position IDs.
+    // mergePositions() uses calculated IDs internally — if they differ from
+    // CLOB IDs, the merge will revert because calculated IDs have no balance.
+    const calcYesId = this.calculatePositionId(conditionId, 1);
+    const calcNoId = this.calculatePositionId(conditionId, 2);
+    const calcYesDecimal = BigNumber.from(calcYesId).toString();
+    const calcNoDecimal = BigNumber.from(calcNoId).toString();
+
+    if (calcYesDecimal !== tokenIds.yesTokenId || calcNoDecimal !== tokenIds.noTokenId) {
+      // NegRisk market: CLOB tokens differ from standard CTF position IDs.
+      // Check if calculated position IDs actually have balance.
+      const calcBalances = await this.getPositionBalance(conditionId);
+      const calcYesBal = ethers.utils.parseUnits(calcBalances.yesBalance, USDC_DECIMALS);
+      const calcNoBal = ethers.utils.parseUnits(calcBalances.noBalance, USDC_DECIMALS);
+
+      if (calcYesBal.lt(amountWei) || calcNoBal.lt(amountWei)) {
+        throw new Error(
+          `NegRisk market detected: CLOB token IDs differ from CTF position IDs. ` +
+          `CLOB balance: YES=${balances.yesBalance}, NO=${balances.noBalance}. ` +
+          `CTF position balance: YES=${calcBalances.yesBalance}, NO=${calcBalances.noBalance}. ` +
+          `Standard CTF merge requires tokens at calculated position IDs. ` +
+          `Tokens acquired via CLOB on NegRisk markets cannot be merged directly. ` +
+          `Sell tokens via CLOB instead.`
+        );
+      }
+    }
+
+    // Use safe amount: min(requested, yesBalance, noBalance)
+    let safeAmountWei = amountWei;
+    if (yesBalance.lt(safeAmountWei)) safeAmountWei = yesBalance;
+    if (noBalance.lt(safeAmountWei)) safeAmountWei = noBalance;
+
+    // Dry-run to catch revert reason before submitting actual transaction
+    try {
+      await this.ctfContract.callStatic.mergePositions(
+        USDC_CONTRACT,
+        ethers.constants.HashZero,
+        conditionId,
+        [1, 2],
+        safeAmountWei,
+      );
+    } catch (error: any) {
+      const reason = error?.reason || error?.error?.message || error?.message || 'unknown';
+      throw new Error(
+        `Merge dry-run failed (callStatic reverted): ${reason}. ` +
+        `Amount: ${ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS)}, ` +
+        `YES: ${balances.yesBalance}, NO: ${balances.noBalance}, ` +
+        `conditionId: ${conditionId}`
+      );
+    }
+
+    // Execute merge with explicit gasLimit to avoid estimateGas masking the error
+    const gasOptions = await this.getGasOptions();
     const tx = await this.ctfContract.mergePositions(
       USDC_CONTRACT,
       ethers.constants.HashZero,
       conditionId,
       [1, 2],
-      amountWei,
-      await this.getGasOptions()
+      safeAmountWei,
+      { ...gasOptions, gasLimit: 500000 }
     );
 
     const receipt = await tx.wait();
 
+    const mergedAmount = ethers.utils.formatUnits(safeAmountWei, USDC_DECIMALS);
     return {
       success: true,
       txHash: receipt.transactionHash,
-      amount,
-      usdcReceived: amount, // 1:1 merge
+      amount: mergedAmount,
+      usdcReceived: mergedAmount,
       gasUsed: receipt.gasUsed.toString(),
     };
   }
