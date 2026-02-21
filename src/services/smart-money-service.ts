@@ -152,6 +152,8 @@ export interface AutoCopyTradingOptions {
   minTradeSize?: number;
   /** Only copy BUY or SELL trades */
   sideFilter?: 'BUY' | 'SELL';
+  /** Custom trade filter — return true to copy, false to skip */
+  tradeFilter?: (trade: SmartMoneyTrade) => boolean;
 
   /** Dry run mode */
   dryRun?: boolean;
@@ -1091,6 +1093,12 @@ export class SmartMoneyService {
           }
 
           if (sideFilter && trade.side !== sideFilter) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          // Custom trade filter
+          if (options.tradeFilter && !options.tradeFilter(trade)) {
             stats.tradesSkipped++;
             return;
           }

@@ -559,6 +559,22 @@ export {
 } from './utils/price-utils.js';
 export type { TickSize } from './utils/price-utils.js';
 
+// Calldata decoder (for mempool pending TX decoding — copy-trading)
+export {
+  decodeMatchOrdersCalldata,
+  isSettlementTx,
+  extractTraderAddresses,
+  CTF_ROUTER,
+  NEG_RISK_ROUTER,
+  MATCH_ORDERS_SELECTOR,
+  ROUTER_ADDRESSES,
+  OrderSide,
+} from './utils/calldata-decoder.js';
+export type {
+  DecodedOrder,
+  DecodedMatchOrders,
+} from './utils/calldata-decoder.js';
+
 // Wallet Management (Hot Wallet for automated trading)
 export {
   HotWalletService,

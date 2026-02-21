@@ -135,6 +135,8 @@ export interface UserTrade {
   side: 'BUY' | 'SELL';
   status: 'MATCHED' | 'MINED' | 'CONFIRMED' | 'RETRYING' | 'FAILED';
   timestamp: number;
+  /** Server-side match timestamp (ms) — when CLOB engine matched the order */
+  matchTime?: number;
   transactionHash?: string;
   /** Taker's order ID - use this to link trade to order */
   takerOrderId?: string;
@@ -388,6 +390,19 @@ export class RealtimeServiceV2 extends EventEmitter {
       if (!this.connected) {
         throw error;
       }
+    }
+  }
+
+  /**
+   * Force reconnect the market channel WebSocket.
+   * Terminates the current connection and triggers auto-reconnect,
+   * which will re-subscribe to all accumulated market tokens.
+   * Use when data flow stops but the connection appears alive.
+   */
+  reconnectMarketChannel(): void {
+    if (this.client) {
+      this.log('Force reconnecting market channel...');
+      this.client.forceReconnect();
     }
   }
 
@@ -1370,6 +1385,10 @@ export class RealtimeServiceV2 extends EventEmitter {
         }));
       }
 
+      // Extract matchtime — CLOB server-side match timestamp (more accurate than payload.timestamp)
+      const matchTimeRaw = payload.matchtime as string | number | undefined;
+      const matchTime = matchTimeRaw ? Number(matchTimeRaw) : undefined;
+
       const trade: UserTrade = {
         tradeId: payload.trade_id as string || '',
         market: payload.market as string || '',
@@ -1379,6 +1398,7 @@ export class RealtimeServiceV2 extends EventEmitter {
         side: payload.side as 'BUY' | 'SELL',
         status: payload.status as 'MATCHED' | 'MINED' | 'CONFIRMED' | 'RETRYING' | 'FAILED',
         timestamp,
+        matchTime,
         transactionHash: payload.transaction_hash as string | undefined,
         // New fields for order-trade linking
         takerOrderId: payload.taker_order_id as string | undefined,
