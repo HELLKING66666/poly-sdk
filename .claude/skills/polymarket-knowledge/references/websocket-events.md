@@ -71,34 +71,53 @@ Trade execution events for the authenticated user.
 
 ```json
 {
-  "trade_id": "abc123",
+  "type": "TRADE",
+  "id": "7fe5ed2d-...",
   "taker_order_id": "0x...",
   "market": "0x...",
   "asset_id": "12345...",
-  "outcome": "Yes",
+  "outcome": "Up",
   "side": "BUY",
-  "price": "0.50",
+  "price": "0.07",
   "size": "10",
-  "status": "CONFIRMED",
+  "status": "MATCHED",
+  "match_time": "1771746841",
+  "last_update": "1771746841",
+  "timestamp": "1771746841700",
+  "fee_rate_bps": "1000",
+  "owner": "a23a3e42-...",
+  "trade_owner": "a23a3e42-...",
+  "maker_address": "0x...",
   "transaction_hash": "0x...",
+  "trader_side": "TAKER",
+  "event_type": "trade",
   "maker_orders": [
     {
       "order_id": "0x...",
       "matched_amount": "10",
-      "price": "0.50",
+      "price": "0.07",
+      "fee_rate_bps": "1000",
       "asset_id": "12345...",
-      "outcome": "Yes",
-      "owner": "0x..."
+      "outcome": "Up",
+      "outcome_index": 0,
+      "side": "SELL",
+      "owner": "d0030308-...",
+      "maker_address": "0x..."
     }
   ]
 }
 ```
 
+> **Verified 2026-02-22**: Real WS payload captured. Key findings:
+> - `match_time` (with underscore) is present in ALL statuses (MATCHED/MINED/CONFIRMED)
+> - `match_time` is Unix seconds (string), `timestamp` is Unix milliseconds (string)
+> - Additional fields: `type`, `fee_rate_bps`, `owner`, `trade_owner`, `maker_address`, `trader_side`, `event_type`
+
 ### Field Mapping
 
 | API Field | SDK Field | Type | Notes |
 |-----------|-----------|------|-------|
-| `trade_id` | `tradeId` | string | May be empty for MATCHED |
+| `id` (or `trade_id`) | `tradeId` | string | API uses `id` field (e.g., "7fe5ed2d-..."). Fallback to `trade_id` for compat. |
 | `taker_order_id` | `takerOrderId` | string | Order that took liquidity |
 | `market` | `market` | string | Condition ID |
 | `asset_id` | `assetId` | string | Token ID |
@@ -107,6 +126,9 @@ Trade execution events for the authenticated user.
 | `price` | `price` | number | |
 | `size` | `size` | number | Total trade size |
 | `status` | `status` | string | MATCHED, MINED, CONFIRMED, etc |
+| `match_time` | `matchTime` | number | **CLOB server-side match timestamp** (Unix seconds string, e.g. "1771746841"). Use `normalizeTimestamp()` to convert to ms. Present in ALL statuses (MATCHED/MINED/CONFIRMED). **NOTE: API field is `match_time` with underscore, NOT `matchtime`!** |
+| `timestamp` | `timestamp` | number | Event timestamp (Unix milliseconds string, e.g. "1771746841700") |
+| `last_update` | — | number | Last status update timestamp (Unix seconds string) |
 | `transaction_hash` | `transactionHash` | string | After MINED |
 | `maker_orders` | `makerOrders` | array | Maker side details |
 

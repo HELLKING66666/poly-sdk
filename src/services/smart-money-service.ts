@@ -29,10 +29,18 @@
  * - Data API 限流：300 req/min
  */
 
+import WebSocket from 'ws';
 import type { WalletService, TimePeriod, PeriodLeaderboardEntry } from './wallet-service.js';
 import type { RealtimeServiceV2 } from './realtime-service-v2.js';
 import type { TradingService, OrderResult } from './trading-service.js';
 import type { Position, ClosedPosition, ClosedPositionsParams, DataApiClient, Activity } from '../clients/data-api.js';
+import {
+  ROUTER_ADDRESSES,
+  MATCH_ORDERS_SELECTOR,
+  decodeMatchOrdersCalldata,
+  extractTraderAddresses,
+  OrderSide,
+} from '../utils/calldata-decoder.js';
 
 // ============================================================================
 // Market Categorization (exported utilities)
@@ -158,9 +166,61 @@ export interface AutoCopyTradingOptions {
   /** Dry run mode */
   dryRun?: boolean;
 
+  // ========== Phase 1: Detection Mode ==========
+
+  /** Detection mode: 'polling' (Data API, ~5s), 'mempool' (WSS, ~442ms), or 'dual' (both + dedup) */
+  detectionMode?: 'polling' | 'mempool' | 'dual';
+
+  // ========== Phase 2: Enhanced Execution ==========
+
+  /** OrderManager instance (optional) — enables OrderHandle lifecycle tracking */
+  orderManager?: any; // Will be typed as OrderManager when imported
+
+  /** Order mode: 'market' (default) or 'limit' */
+  orderMode?: 'market' | 'limit';
+
+  /** Limit mode price offset (relative to detected price)
+   * BUY: limitPrice = detectedPrice + offset
+   * SELL: limitPrice = detectedPrice - offset
+   * Default: 0.01 (1 cent)
+   */
+  limitPriceOffset?: number;
+
+  /** Price range filter (optional)
+   * Skip trades where detected price is outside this range
+   * Example: { min: 0.05, max: 0.95 } only follows 5%-95% price range
+   */
+  priceRange?: {
+    min: number; // 0-1
+    max: number; // 0-1
+  };
+
+  /** Split order count (limit mode only)
+   * Split single order into N limit orders (via OrderManager.createBatchOrders)
+   * Default: 1 (no split)
+   * Max: 15 (Polymarket CLOB limit)
+   */
+  splitCount?: number;
+
+  /** Split order price spread (only when splitCount > 1)
+   * Price step between each split order, default 0.001 (0.1 cent)
+   * Example: splitCount=3, splitSpread=0.01
+   *   BUY: limitPrice, limitPrice+0.01, limitPrice+0.02
+   *   SELL: limitPrice, limitPrice-0.01, limitPrice-0.02
+   */
+  splitSpread?: number;
+
+  // ========== Callbacks ==========
+
   /** Callbacks */
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
   onError?: (error: Error) => void;
+
+  /** Order placed callback (OrderHandle available) */
+  onOrderPlaced?: (handle: any) => void; // Will be typed as OrderHandle when imported
+
+  /** Order filled callback (includes FillEvent details) */
+  onOrderFilled?: (fill: any) => void; // Will be typed as FillEvent when imported
 }
 
 /**
@@ -173,6 +233,7 @@ export interface AutoCopyTradingStats {
   tradesSkipped: number;
   tradesFailed: number;
   totalUsdcSpent: number;
+  filteredByPrice?: number; // Phase 2: count trades filtered by priceRange
 }
 
 /**
@@ -196,6 +257,8 @@ export interface SmartMoneyServiceConfig {
   minPnl?: number;
   /** Cache TTL (default: 300000 = 5 min) */
   cacheTtl?: number;
+  /** QuickNode WSS URL for mempool pending TX detection */
+  mempoolWssUrl?: string;
 }
 
 // ============================================================================
@@ -701,6 +764,10 @@ export class SmartMoneyService {
   private targetWallets: string[] = [];
   private pollInterval: number = 5000; // 默认 5 秒
 
+  // Mempool 相关
+  private mempoolWs: WebSocket | null = null;
+  private mempoolTargetAddresses: Set<string> = new Set();
+
   constructor(
     walletService: WalletService,
     realtimeService: RealtimeServiceV2,
@@ -716,6 +783,7 @@ export class SmartMoneyService {
     this.config = {
       minPnl: config.minPnl ?? 1000,
       cacheTtl: config.cacheTtl ?? 300000,
+      mempoolWssUrl: config.mempoolWssUrl ?? '',
     };
   }
 
@@ -754,8 +822,10 @@ export class SmartMoneyService {
         })
       );
 
-      // 更新时间戳
-      this.lastCheckTimestamp = now;
+      // 更新时间戳 — 保留 10s 重叠窗口以应对 Data API 索引延迟
+      // 依赖 seenTxHashes 去重避免重复处理
+      const OVERLAP_SECONDS = 10;
+      this.lastCheckTimestamp = Math.max(start, now - OVERLAP_SECONDS);
 
       // 合并结果并按时间排序
       return results
@@ -860,6 +930,184 @@ export class SmartMoneyService {
   }
 
   // ============================================================================
+  // Mempool Detection - Mempool v2 Raw WSS 检测
+  // ============================================================================
+
+  /**
+   * Start mempool monitor for pending TX detection (~442ms latency)
+   * Ported from strategy-impl/src/copy-trading/wallet-monitor.ts
+   */
+  private startMempoolMonitor(): void {
+    if (this.mempoolWs) {
+      return; // Already connected
+    }
+
+    const wssUrl = this.config.mempoolWssUrl;
+    if (!wssUrl) {
+      console.warn('[SmartMoneyService] Mempool WSS URL not configured, skipping mempool monitor');
+      return;
+    }
+
+    // Sync target addresses
+    for (const addr of this.targetWallets) {
+      this.mempoolTargetAddresses.add(addr.toLowerCase());
+    }
+
+    console.log('[SmartMoneyService] Starting Mempool v2 WSS monitor', {
+      wssUrl: wssUrl.slice(0, 30) + '...',
+      targets: this.mempoolTargetAddresses.size,
+    });
+
+    const ws = new WebSocket(wssUrl);
+    this.mempoolWs = ws;
+
+    ws.on('open', () => {
+      console.log('[SmartMoneyService] Mempool WSS connected, subscribing to newPendingTransactions');
+      ws.send(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_subscribe',
+          params: ['newPendingTransactions', true], // true = full TX objects
+        }),
+      );
+    });
+
+    ws.on('message', (data: Buffer) => {
+      this.handleMempoolMessage(data);
+    });
+
+    ws.on('error', (err: any) => {
+      console.warn('[SmartMoneyService] Mempool WSS error:', err.message);
+    });
+
+    ws.on('close', () => {
+      console.warn('[SmartMoneyService] Mempool WSS closed');
+      this.mempoolWs = null;
+    });
+  }
+
+  /**
+   * Handle mempool pending TX message
+   * Filters for Polymarket Router TXs, decodes calldata, matches target wallets
+   */
+  private handleMempoolMessage(data: Buffer): void {
+    const t0 = Date.now();
+
+    try {
+      const msg = JSON.parse(data.toString());
+
+      // Subscription confirmation
+      if (msg.id === 1 && msg.result) {
+        console.log('[SmartMoneyService] Mempool subscription confirmed', { subscriptionId: msg.result });
+        return;
+      }
+
+      // New pending TX
+      if (!msg.params?.result) return;
+      const tx = msg.params.result;
+
+      // Fast local filter: is settlement TX? (99%+ filtered out here)
+      if (!tx.to || !ROUTER_ADDRESSES.has(tx.to.toLowerCase())) return;
+      if (!tx.input || !tx.input.startsWith(MATCH_ORDERS_SELECTOR)) return;
+
+      // Decode calldata
+      const decoded = decodeMatchOrdersCalldata(tx.input);
+      if (!decoded) return;
+
+      // Extract trader addresses and match against targets
+      const traders = extractTraderAddresses(decoded);
+      const targetTrader = traders.find((addr: string) => this.mempoolTargetAddresses.has(addr));
+      if (!targetTrader) return;
+
+      // Dedup: check if we've already seen this txHash (for dual mode)
+      if (tx.hash && this.seenTxHashes.has(tx.hash)) return;
+      if (tx.hash) {
+        this.seenTxHashes.add(tx.hash);
+        // Prune old hashes
+        if (this.seenTxHashes.size > 1000) {
+          const toRemove = Array.from(this.seenTxHashes).slice(0, 500);
+          toRemove.forEach(hash => this.seenTxHashes.delete(hash));
+        }
+      }
+
+      // Find the target's order (could be taker or maker)
+      let targetOrder = decoded.takerOrder;
+      if (decoded.takerOrder.maker !== targetTrader && decoded.takerOrder.signer !== targetTrader) {
+        // Target is a maker, find their order
+        const makerOrder = decoded.makerOrders.find(
+          o => o.maker === targetTrader || o.signer === targetTrader,
+        );
+        if (makerOrder) targetOrder = makerOrder;
+      }
+
+      // Calculate price and size from order amounts
+      // BUY (side=0): pay USDC (makerAmount) to get tokens (takerAmount)
+      //   price = makerAmount / takerAmount
+      //   size = takerAmount (token count)
+      // SELL (side=1): sell tokens (makerAmount) to get USDC (takerAmount)
+      //   price = takerAmount / makerAmount
+      //   size = makerAmount (token count)
+      const makerAmt = Number(targetOrder.makerAmount) / 1e6; // USDC has 6 decimals
+      const takerAmt = Number(targetOrder.takerAmount) / 1e6;
+      let price: number;
+      let size: number;
+
+      if (targetOrder.side === OrderSide.BUY) {
+        price = makerAmt / takerAmt;
+        size = takerAmt;
+      } else {
+        price = takerAmt / makerAmt;
+        size = makerAmt;
+      }
+
+      const latency = Date.now() - t0;
+      console.log('[SmartMoneyService] Mempool detection', {
+        trader: targetTrader.slice(0, 10) + '...',
+        txHash: tx.hash?.slice(0, 18) + '...',
+        side: targetOrder.side === OrderSide.BUY ? 'BUY' : 'SELL',
+        size: size.toFixed(2),
+        price: price.toFixed(4),
+        latency: `${latency}ms`,
+      });
+
+      // Build SmartMoneyTrade and notify handlers
+      const trade: SmartMoneyTrade = {
+        traderAddress: targetTrader,
+        side: targetOrder.side === OrderSide.BUY ? 'BUY' : 'SELL',
+        size,
+        price,
+        tokenId: targetOrder.tokenId,
+        txHash: tx.hash,
+        timestamp: Date.now(),
+        isSmartMoney: this.smartMoneySet.has(targetTrader),
+        smartMoneyInfo: this.smartMoneyCache.get(targetTrader),
+        // conditionId, marketSlug, outcome not available from mempool
+      };
+
+      for (const handler of this.tradeHandlers) {
+        try {
+          handler(trade);
+        } catch (error) {
+          console.error('[SmartMoneyService] Handler error (mempool):', error);
+        }
+      }
+    } catch {
+      // Silently ignore parse errors for non-relevant messages
+    }
+  }
+
+  /**
+   * Stop mempool monitor
+   */
+  private stopMempoolMonitor(): void {
+    if (this.mempoolWs) {
+      this.mempoolWs.close();
+      this.mempoolWs = null;
+    }
+  }
+
+  // ============================================================================
   // Smart Money Info
   // ============================================================================
 
@@ -950,6 +1198,7 @@ export class SmartMoneyService {
       filterAddresses?: string[];
       minSize?: number;
       smartMoneyOnly?: boolean;
+      detectionMode?: 'polling' | 'mempool' | 'dual';
     } = {}
   ): { id: string; unsubscribe: () => void } {
     // 创建过滤后的 handler
@@ -986,8 +1235,14 @@ export class SmartMoneyService {
       this.targetWallets = [...new Set([...this.targetWallets, ...normalized])];
     }
 
-    // 启动轮询
-    this.startPolling();
+    // 按 detectionMode 启动检测
+    const mode = options.detectionMode ?? 'polling';
+    if (mode === 'polling' || mode === 'dual') {
+      this.startPolling();
+    }
+    if (mode === 'mempool' || mode === 'dual') {
+      this.startMempoolMonitor();
+    }
 
     const subscriptionId = `smart_money_${Date.now()}`;
 
@@ -996,10 +1251,12 @@ export class SmartMoneyService {
       unsubscribe: () => {
         this.tradeHandlers.delete(filteredHandler);
 
-        // 如果没有 handler 了，停止轮询
+        // 如果没有 handler 了，停止检测
         if (this.tradeHandlers.size === 0) {
           this.stopPolling();
+          this.stopMempoolMonitor();
           this.targetWallets = [];
+          this.mempoolTargetAddresses.clear();
           this.seenTxHashes.clear();
         }
       },
@@ -1062,6 +1319,7 @@ export class SmartMoneyService {
       tradesSkipped: 0,
       tradesFailed: 0,
       totalUsdcSpent: 0,
+      filteredByPrice: 0, // Phase 2
     };
 
     // Config
@@ -1073,6 +1331,12 @@ export class SmartMoneyService {
     const sideFilter = options.sideFilter;
     const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
+
+    // Phase 2: Enhanced execution config
+    const orderMode = options.orderMode ?? 'market';
+    const limitPriceOffset = options.limitPriceOffset ?? 0.01;
+    const splitCount = options.splitCount ?? 1;
+    const splitSpread = options.splitSpread ?? 0.001;
 
     // Subscribe
     const subscription = this.subscribeSmartMoneyTrades(
@@ -1097,14 +1361,25 @@ export class SmartMoneyService {
             return;
           }
 
+          // Phase 2: Price range filter
+          if (options.priceRange) {
+            const { min, max } = options.priceRange;
+            if (trade.price < min || trade.price > max) {
+              stats.tradesSkipped++;
+              stats.filteredByPrice = (stats.filteredByPrice || 0) + 1;
+              return;
+            }
+          }
+
           // Custom trade filter
           if (options.tradeFilter && !options.tradeFilter(trade)) {
             stats.tradesSkipped++;
             return;
           }
 
-          // Calculate size
-          let copySize = trade.size * sizeScale;
+          // Calculate size (Polymarket minimum: 5 shares)
+          const MIN_SHARES = 5;
+          let copySize = Math.max(MIN_SHARES, trade.size * sizeScale);
           let copyValue = copySize * trade.price;
 
           // Enforce max size
@@ -1149,22 +1424,87 @@ export class SmartMoneyService {
               side: trade.side,
               market: trade.marketSlug,
               copy: { size: copySize.toFixed(2), usdc: usdcAmount.toFixed(2) },
+              mode: orderMode,
             });
           } else {
-            result = await this.tradingService.createMarketOrder({
-              tokenId,
-              side: trade.side,
-              amount: usdcAmount,
-              price: slippagePrice,
-              orderType,
-            });
+            // Phase 2: Route selection (OrderManager limit vs TradingService market)
+            if (options.orderManager && orderMode === 'limit') {
+              // Limit Order path (via OrderManager)
+              const limitPrice = this.calculateLimitPrice(trade.side, trade.price, limitPriceOffset);
+
+              if (splitCount === 1) {
+                // Single limit order
+                const handle = options.orderManager.placeOrder({
+                  tokenId,
+                  side: trade.side,
+                  price: limitPrice,
+                  size: copySize,
+                  orderType: 'GTC',
+                });
+
+                // Notify via callback
+                if (options.onOrderPlaced) {
+                  options.onOrderPlaced(handle);
+                }
+
+                // Register fill handlers
+                handle
+                  .onFilled((fill: any) => {
+                    stats.tradesExecuted++;
+                    stats.totalUsdcSpent += copyValue;
+                    if (options.onOrderFilled) {
+                      options.onOrderFilled(fill);
+                    }
+                  })
+                  .onRejected((reason: string) => {
+                    stats.tradesFailed++;
+                    console.warn('[Copy Trading] Order rejected:', reason);
+                  });
+
+                result = { success: true, orderId: handle.orderId };
+              } else {
+                // Split orders (via createBatchOrders)
+                try {
+                  const orders = this.createSplitOrders({
+                    tokenId,
+                    side: trade.side,
+                    basePrice: trade.price,
+                    totalSize: copySize,
+                    splitCount,
+                    splitSpread,
+                    limitPriceOffset,
+                  });
+
+                  result = await this.tradingService.createBatchOrders(orders);
+                  // Note: createBatchOrders returns OrderResult without OrderHandle
+                  // Split orders need manual watch via orderIds
+                } catch (error) {
+                  result = {
+                    success: false,
+                    errorMsg: error instanceof Error ? error.message : String(error),
+                  };
+                }
+              }
+            } else {
+              // Original Market Order path (via TradingService)
+              result = await this.tradingService.createMarketOrder({
+                tokenId,
+                side: trade.side,
+                amount: usdcAmount,
+                price: slippagePrice,
+                orderType,
+              });
+            }
           }
 
-          if (result.success) {
-            stats.tradesExecuted++;
-            stats.totalUsdcSpent += usdcAmount;
-          } else {
-            stats.tradesFailed++;
+          // Update stats (for market orders and split orders)
+          if (!options.orderManager || orderMode !== 'limit' || splitCount > 1) {
+            if (result.success) {
+              stats.tradesExecuted++;
+              stats.totalUsdcSpent += usdcAmount;
+            } else {
+              stats.tradesFailed++;
+            }
           }
 
           options.onTrade?.(trade, result);
@@ -1173,7 +1513,7 @@ export class SmartMoneyService {
           options.onError?.(error instanceof Error ? error : new Error(String(error)));
         }
       },
-      { filterAddresses: targetAddresses, minSize: minTradeSize }
+      { filterAddresses: targetAddresses, minSize: minTradeSize, detectionMode: options.detectionMode }
     );
 
     return {
@@ -2393,13 +2733,102 @@ export class SmartMoneyService {
     return Date.now() - this.cacheTimestamp < this.config.cacheTtl && this.smartMoneyCache.size > 0;
   }
 
+  // ============================================================================
+  // Phase 2: Enhanced Copy Trading Utilities
+  // ============================================================================
+
+  /**
+   * Calculate limit price based on detected price and offset
+   * BUY: limitPrice = detectedPrice + offset
+   * SELL: limitPrice = detectedPrice - offset
+   */
+  private calculateLimitPrice(side: 'BUY' | 'SELL', detectedPrice: number, offset: number): number {
+    const raw = side === 'BUY' ? detectedPrice + offset : detectedPrice - offset;
+    return this.roundToTick(this.clamp(raw, 0.01, 0.99));
+  }
+
+  /**
+   * Create split orders for batch execution
+   * Splits total size into N orders with price gradation
+   */
+  private createSplitOrders(params: {
+    tokenId: string;
+    side: 'BUY' | 'SELL';
+    basePrice: number;
+    totalSize: number;
+    splitCount: number;
+    splitSpread: number;
+    limitPriceOffset: number;
+  }): Array<{
+    tokenId: string;
+    side: 'BUY' | 'SELL';
+    price: number;
+    size: number;
+    orderType: 'GTC';
+  }> {
+    const { tokenId, side, basePrice, totalSize, splitCount, splitSpread, limitPriceOffset } = params;
+
+    // Validate splitCount
+    if (splitCount > 15) {
+      throw new Error(`Split count (${splitCount}) exceeds Polymarket maximum (15 orders)`);
+    }
+
+    // Split size (each order must be at least 5 shares)
+    const sizePerOrder = Math.floor(totalSize / splitCount);
+    if (sizePerOrder < 5) {
+      throw new Error(`Split order size (${sizePerOrder}) below minimum (5 shares)`);
+    }
+
+    const baseLimitPrice = this.calculateLimitPrice(side, basePrice, limitPriceOffset);
+
+    const orders: Array<{
+      tokenId: string;
+      side: 'BUY' | 'SELL';
+      price: number;
+      size: number;
+      orderType: 'GTC';
+    }> = [];
+
+    for (let i = 0; i < splitCount; i++) {
+      // Price gradation: BUY goes up, SELL goes down
+      const priceOffset = side === 'BUY' ? i * splitSpread : -i * splitSpread;
+      const limitPrice = this.roundToTick(this.clamp(baseLimitPrice + priceOffset, 0.01, 0.99));
+
+      orders.push({
+        tokenId,
+        side,
+        price: limitPrice,
+        size: sizePerOrder,
+        orderType: 'GTC',
+      });
+    }
+
+    return orders;
+  }
+
+  /**
+   * Round price to tick (0.01)
+   */
+  private roundToTick(price: number): number {
+    return Math.round(price * 100) / 100;
+  }
+
+  /**
+   * Clamp value between min and max
+   */
+  private clamp(value: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, value));
+  }
+
   disconnect(): void {
-    // 停止轮询
+    // 停止轮询和 mempool
     this.stopPolling();
+    this.stopMempoolMonitor();
 
     // 清理状态
     this.tradeHandlers.clear();
     this.targetWallets = [];
+    this.mempoolTargetAddresses.clear();
     this.seenTxHashes.clear();
     this.smartMoneyCache.clear();
     this.smartMoneySet.clear();

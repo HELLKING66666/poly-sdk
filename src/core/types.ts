@@ -258,6 +258,13 @@ export interface PolySDKOptions {
     secret: string;
     passphrase: string;
   };
+
+  /**
+   * QuickNode WSS URL for mempool pending TX detection.
+   * Required for detectionMode 'mempool' or 'dual' in copy trading.
+   * Must support newPendingTransactions with full TX objects.
+   */
+  mempoolWssUrl?: string;
 }
 
 // K-Line interval types

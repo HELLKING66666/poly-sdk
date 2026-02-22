@@ -666,7 +666,7 @@ export class PolymarketSDK {
       this.realtime,
       this.tradingService,
       this.dataApi,  // DataApiClient (required)
-      {}  // default config
+      { mempoolWssUrl: config.mempoolWssUrl },
     );
 
     // Initialize DipArbService

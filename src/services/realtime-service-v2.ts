@@ -1385,12 +1385,16 @@ export class RealtimeServiceV2 extends EventEmitter {
         }));
       }
 
-      // Extract matchtime — CLOB server-side match timestamp (more accurate than payload.timestamp)
-      const matchTimeRaw = payload.matchtime as string | number | undefined;
-      const matchTime = matchTimeRaw ? Number(matchTimeRaw) : undefined;
+      // Extract match_time — CLOB server-side match timestamp (more accurate than payload.timestamp)
+      // API field is "match_time" (with underscore), value is Unix seconds (string)
+      // Must use normalizeTimestamp() to convert seconds → ms
+      const matchTimeRaw = payload.match_time ?? payload.matchtime;
+      const matchTime = matchTimeRaw != null
+        ? this.normalizeTimestamp(matchTimeRaw)
+        : undefined;
 
       const trade: UserTrade = {
-        tradeId: payload.trade_id as string || '',
+        tradeId: (payload.id ?? payload.trade_id) as string || '',
         market: payload.market as string || '',
         outcome: payload.outcome as string || '',
         price: Number(payload.price) || 0,
