@@ -2772,10 +2772,18 @@ export class SmartMoneyService {
       throw new Error(`Split count (${splitCount}) exceeds Polymarket maximum (15 orders)`);
     }
 
-    // Split size (each order must be at least 5 shares)
-    const sizePerOrder = Math.floor(totalSize / splitCount);
-    if (sizePerOrder < 5) {
-      throw new Error(`Split order size (${sizePerOrder}) below minimum (5 shares)`);
+    // Auto-reduce splitCount if totalSize can't support requested splits (minimum 5 shares each)
+    const MIN_SHARES = 5;
+    let effectiveSplitCount = splitCount;
+    while (effectiveSplitCount > 1 && Math.floor(totalSize / effectiveSplitCount) < MIN_SHARES) {
+      effectiveSplitCount--;
+    }
+    const sizePerOrder = Math.floor(totalSize / effectiveSplitCount);
+    if (sizePerOrder < MIN_SHARES) {
+      throw new Error(`Split order size (${sizePerOrder}) below minimum (${MIN_SHARES} shares). Total: ${totalSize}, split: ${effectiveSplitCount}`);
+    }
+    if (effectiveSplitCount < splitCount) {
+      console.log(`[SmartMoney] Split count auto-reduced: ${splitCount} → ${effectiveSplitCount} (totalSize=${totalSize}, min=${MIN_SHARES}/order)`);
     }
 
     const baseLimitPrice = this.calculateLimitPrice(side, basePrice, limitPriceOffset);
@@ -2788,7 +2796,7 @@ export class SmartMoneyService {
       orderType: 'GTC';
     }> = [];
 
-    for (let i = 0; i < splitCount; i++) {
+    for (let i = 0; i < effectiveSplitCount; i++) {
       // Price gradation: BUY goes up, SELL goes down
       const priceOffset = side === 'BUY' ? i * splitSpread : -i * splitSpread;
       const limitPrice = this.roundToTick(this.clamp(baseLimitPrice + priceOffset, 0.01, 0.99));

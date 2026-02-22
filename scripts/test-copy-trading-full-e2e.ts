@@ -64,8 +64,11 @@ const TARGET_BUILDER = {
   passphrase: process.env.TARGET_BUILDER_PASSPHRASE!,
 };
 
-const DETECTION_MODE = (process.env.DETECTION_MODE || 'polling') as 'polling' | 'mempool' | 'dual';
+const DETECTION_MODE = (process.env.DETECTION_MODE || 'polling') as 'polling' | 'mempool';
 const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
+
+// Test scenario: full (default) | priceRange | split | mempool
+const TEST_SCENARIO = process.env.TEST_SCENARIO || 'full';
 
 function validateEnv() {
   const required = [
@@ -373,23 +376,56 @@ async function main() {
   // Step 5: Start Copy Trading
   // ------------------------------------------------------------------
   log('COPY', `Starting auto copy trading on ${targetSafe.slice(0, 10)}...`);
-  log('COPY', `Detection: ${DETECTION_MODE} | limit GTC +0.02 | scale 1.0 | max $5`);
+  log('COPY', `Detection: ${DETECTION_MODE} | scenario: ${TEST_SCENARIO}`);
+
+  // Build config based on TEST_SCENARIO
+  const isPriceRangeTest = TEST_SCENARIO === 'priceRange';
+  const isSplitTest = TEST_SCENARIO === 'split';
+  const detectionMode = TEST_SCENARIO === 'mempool' ? 'mempool' as const : DETECTION_MODE;
+
+  const copyConfig: any = {
+    targetAddresses: [targetSafe],
+    detectionMode,
+    orderManager: copyOM,
+    orderMode: 'limit',
+    limitPriceOffset: 0.02,
+    sizeScale: 1.0,
+    maxSizePerTrade: 5,
+    minTradeSize: 0.1,
+    dryRun: false,
+  };
+
+  // Price Range test: narrow range that excludes typical mid-market fill prices (~0.45-0.55)
+  // Crypto 15m markets fill at mid-market despite extreme orderbook (ask=0.99)
+  if (isPriceRangeTest) {
+    copyConfig.priceRange = { min: 0.60, max: 0.70 };
+    log('COPY', `🔬 Price Range test: { min: 0.60, max: 0.70 } — expect trades FILTERED (fills ~0.45-0.55)`);
+  } else {
+    copyConfig.priceRange = { min: 0.01, max: 0.99 };
+  }
+
+  // Split test: 3 orders with 0.01 spread
+  // Need totalSize >= 15 (3 × 5 minimum shares), so scale up 3x
+  if (isSplitTest) {
+    copyConfig.splitCount = 3;
+    copyConfig.splitSpread = 0.01;
+    copyConfig.sizeScale = 3.0;       // 5 shares × 3 = 15 shares total
+    copyConfig.maxSizePerTrade = 20;  // cap at $20 (15 shares × ~$0.50 = ~$7.50)
+    log('COPY', `🔬 Split test: splitCount=3, splitSpread=0.01, sizeScale=3.0`);
+  }
+
+  if (TEST_SCENARIO === 'mempool') {
+    log('COPY', `🔬 Mempool test: detectionMode=mempool, expect <1s latency`);
+  }
+
+  log('COPY', `Config: mode=${detectionMode} | limit GTC +0.02 | scale 1.0 | max $${copyConfig.maxSizePerTrade}`);
 
   let phase1Detected = false;
   let phase2Detected = false;
   let detectionCount = 0;
 
   const sub = await copySdk.smartMoney.startAutoCopyTrading({
-    targetAddresses: [targetSafe],
-    detectionMode: DETECTION_MODE,
-    orderManager: copyOM,
-    orderMode: 'limit',
-    limitPriceOffset: 0.02,
-    priceRange: { min: 0.05, max: 0.95 },
-    sizeScale: 1.0,
-    maxSizePerTrade: 5,
-    minTradeSize: 0.1,
-    dryRun: false,
+    ...copyConfig,
 
     onTrade: (trade: SmartMoneyTrade, result: any) => {
       const now = Date.now();
@@ -559,6 +595,35 @@ async function main() {
 
   // Full timing report
   printReport();
+
+  // Scenario-specific pass/fail evaluation
+  console.log('\n── Scenario Evaluation ─────────────────────────────────────\n');
+  if (isPriceRangeTest) {
+    const filtered = stats.filteredByPrice || 0;
+    const pass = filtered > 0 && stats.tradesExecuted === 0;
+    console.log(`Price Range Test: ${pass ? '✅ PASS' : '❌ FAIL'}`);
+    console.log(`  Filtered: ${filtered} (expected > 0)`);
+    console.log(`  Executed: ${stats.tradesExecuted} (expected 0)`);
+  } else if (isSplitTest) {
+    // Split: each detection should produce 3 orders (via batch), stats counts batch as 1
+    const pass = stats.tradesDetected >= 1 && stats.tradesExecuted >= 1;
+    console.log(`Split Test: ${pass ? '✅ PASS' : '❌ FAIL'}`);
+    console.log(`  Detected: ${stats.tradesDetected} (expected >= 1)`);
+    console.log(`  Executed: ${stats.tradesExecuted} (expected >= 1, each = ${copyConfig.splitCount} sub-orders)`);
+  } else if (TEST_SCENARIO === 'mempool') {
+    const avgLatency = timings.filter(t => t.matchTime && t.copyDetectTime)
+      .map(t => (t.copyDetectTime! - t.matchTime!) / 1000);
+    const maxLatency = avgLatency.length > 0 ? Math.max(...avgLatency) : Infinity;
+    const pass = stats.tradesDetected >= 1 && maxLatency < 3;
+    console.log(`Mempool Test: ${pass ? '✅ PASS' : '❌ FAIL'}`);
+    console.log(`  Detected: ${stats.tradesDetected} (expected >= 1)`);
+    console.log(`  Max latency: ${maxLatency.toFixed(1)}s (expected < 3s)`);
+  } else {
+    const pass = stats.tradesDetected >= 2 && stats.tradesExecuted >= 2;
+    console.log(`Full E2E: ${pass ? '✅ PASS' : '❌ FAIL'}`);
+    console.log(`  Detected: ${stats.tradesDetected}/2`);
+    console.log(`  Executed: ${stats.tradesExecuted}/2`);
+  }
 
   // ------------------------------------------------------------------
   // Cleanup
